@@ -199,9 +199,37 @@ func (e *Engine) SendCommand(command string) error {
 
 // SendFEN updates the engine position with a FEN string
 func (e *Engine) SendFEN(fen string) error {
-	err := e.SendCommand(fmt.Sprintf("position fen %s", fen))
-	return err
+	return e.SendCommand(fmt.Sprintf("position fen %s", fen))
 }
+
+// SendUCINewGame sends a ucinewgame command to the engine
+func (e *Engine) SendUCINewGame() error {
+	return e.SendCommand("ucinewgame")
+}
+
+// SendStop sends a stop command to the engine
+func (e *Engine) SendStop() error {
+	return e.SendCommand("stop")
+}
+
+// SendQuit sends a quit command to the engine and waits for the program to
+// exit
+func (e *Engine) SendQuit() error {
+	if err := e.SendCommand("quit"); err != nil {
+		return err
+	}
+
+	if err := e.cmd.Wait(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SendPonderHit sends a ponderhit command to the engine
+// func (e *Engine) SendPonderHit() error {
+// return e.SendCommand("ponderhit")
+// }
 
 // SendOption sends an option to the engine
 func (e *Engine) SendOption(name, value string) error {
@@ -242,6 +270,10 @@ func (e *Engine) SendOption(name, value string) error {
 
 // WaitReadyOK sends isready to engine and waits for readyok
 // sets a 5s timeout and checks every 10ms for the readyok response
+//
+// Note: while isready can be sent to the engine at any time, even while the
+// engine is calculating, this function throws away any other output from the
+// engine while waiting for isready, so this should be used with care
 func (e *Engine) WaitReadyOK() error {
 	if err := e.SendCommand("isready\n"); err != nil {
 		return err
