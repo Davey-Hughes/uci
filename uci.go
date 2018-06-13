@@ -49,6 +49,12 @@ type EngOption struct {
 	Var     []string // predefined values of this parameter
 }
 
+// BestMove stores the most recent bestmove and ponder
+type BestMove struct {
+	BestMove string
+	Ponder   string
+}
+
 // Score is the score returned by the engine
 type Score struct {
 	Val        int  // score in centipawns or mate in moves
@@ -82,6 +88,7 @@ type Info struct {
 type EngChans struct {
 	infoDone chan bool
 	readyOK  chan bool
+	bestMove chan BestMove
 }
 
 // Engine holds information about the engine executable, the communication to
@@ -98,9 +105,10 @@ type Engine struct {
 	defaultOptions []EngOption // options returned when sending uci to engine
 	setOptions     []EngOption // options set by GUI
 
-	infoBuf      []Info // information returned by the engine
-	infoBufCap   int    // max capacity of the slice, or 0 if none specified
-	sync.RWMutex        // embedded mutex for editing the info buf
+	infoBuf      []Info   // information returned by the engine
+	infoBufCap   int      // max capacity of the slice, or 0 if none specified
+	lastBestMove BestMove // most recent bestmove
+	sync.RWMutex          // embedded mutex for editing the info buf and bestmove
 
 	chans EngChans // channels used by the engine
 }
@@ -370,6 +378,22 @@ func (e *Engine) WaitCollection(timeout time.Duration) error {
 	}
 }
 
+// WaitBestMove waits for the bestmove to be sent
+func (e *Engine) WaitBestMove(timeout time.Duration) (BestMove, error) {
+	if e.chans.bestMove == nil {
+		return BestMove{}, errors.New("bestMove channel not made")
+	}
+
+	timer := time.After(timeout)
+
+	select {
+	case b := <-e.chans.bestMove:
+		return b, nil
+	case <-timer:
+		return BestMove{}, errors.New("timed out")
+	}
+}
+
 // GetInfo returns the last info lines returned by the engine, or all lines if
 // last is negative
 func (e *Engine) GetInfo(last int) []Info {
@@ -394,6 +418,37 @@ func (e *Engine) GetInfo(last int) []Info {
 func (e *Engine) parseStdout(line string) error {
 	if strings.HasPrefix(line, "readyok") {
 		e.chans.readyOK <- true
+		return nil
+	}
+
+	if strings.HasPrefix(line, "bestmove") {
+		e.Lock()
+
+		lineSlice := strings.Split(line, " ")
+
+		e.lastBestMove.BestMove = lineSlice[1]
+
+		if len(lineSlice) > 2 {
+			e.lastBestMove.Ponder = lineSlice[3]
+		} else {
+			e.lastBestMove.Ponder = ""
+		}
+
+		b := BestMove{e.lastBestMove.BestMove, e.lastBestMove.Ponder}
+
+		e.Unlock()
+
+		// explicitly empty the channel
+	Loop:
+		for {
+			select {
+			case <-e.chans.bestMove:
+			default:
+				break Loop
+			}
+		}
+
+		e.chans.bestMove <- b
 		return nil
 	}
 
@@ -524,6 +579,7 @@ func (e *Engine) parseStdout(line string) error {
 func (e *Engine) StartInfoCollection() error {
 	e.chans.infoDone = make(chan bool)
 	e.chans.readyOK = make(chan bool)
+	e.chans.bestMove = make(chan BestMove, 10)
 
 	go func() error {
 		for {
@@ -532,6 +588,7 @@ func (e *Engine) StartInfoCollection() error {
 				log.Fatalf("%v\n", err)
 			}
 
+			fmt.Println(line + "\n")
 			e.parseStdout(strings.Trim(line, "\n"))
 		}
 	}()
