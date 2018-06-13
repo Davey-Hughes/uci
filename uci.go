@@ -19,7 +19,10 @@ package uci
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"os/exec"
 	"strings"
 )
@@ -45,6 +48,7 @@ type Engine struct {
 
 	name   string
 	author string
+	dName  string
 
 	defaultOptions []EngOption
 	setOptions     []EngOption
@@ -53,7 +57,8 @@ type Engine struct {
 // PrintInfo prints the name, authror, defaultOptions, and SetOptions
 func (e *Engine) PrintInfo() {
 	fmt.Printf("Name: %s\n", e.name)
-	fmt.Printf("Author: %s\n\n", e.author)
+	fmt.Printf("Author: %s\n", e.author)
+	fmt.Printf("Display Name: %s\n\n", e.dName)
 
 	fmt.Println("Default Options:")
 	for _, v := range e.defaultOptions {
@@ -163,7 +168,16 @@ Loop:
 		}
 	}
 
+	if e.dName == "" {
+		e.dName = e.name
+	}
+
 	return nil
+}
+
+// SetDisplayName sets the display name of the engine
+func (e *Engine) SetDisplayName(displayName string) {
+	e.dName = displayName
 }
 
 // SendCommand sends a generic string to the engine without guarantee that
@@ -180,6 +194,12 @@ func (e *Engine) SendCommand(command string) error {
 	}
 
 	return nil
+}
+
+// SendFEN updates the engine position with a FEN string
+func (e *Engine) SendFEN(fen string) error {
+	err := e.SendCommand(fmt.Sprintf("position fen %s", fen))
+	return err
 }
 
 // SendOption sends an option to the engine
@@ -220,8 +240,10 @@ func (e *Engine) SendOption(name, value string) error {
 }
 
 // NewEngineFromPath returns an Engine it has spun up given a path and
-// connected communication to
-func NewEngineFromPath(path string) (*Engine, error) {
+// connected communication to. If the displayName is not specified (empty
+// string), the displayName will be set to the name given by the engine when
+// UCI() is called.
+func NewEngineFromPath(path, displayName string) (*Engine, error) {
 	eng := Engine{}
 	eng.cmd = exec.Command(path)
 	stdin, err := eng.cmd.StdinPipe()
@@ -237,5 +259,76 @@ func NewEngineFromPath(path string) (*Engine, error) {
 	}
 	eng.stdin = bufio.NewWriter(stdin)
 	eng.stdout = bufio.NewReader(stdout)
+	eng.dName = displayName
+
 	return &eng, nil
+}
+
+// EngConfig holds the information specified in the config file
+type EngConfig []struct {
+	DisplayName string `json:"displayName"`
+	Path        string `json:"path"`
+	UCIOptions  []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+}
+
+func (ec *EngConfig) parseConfig(filename string) error {
+	raw, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	if err = json.Unmarshal(raw, &ec); err != nil {
+		return err
+	}
+
+	// checks parsed data
+	// the path for each engine must be specified
+	// if each UCIoption must have a name specified, but value is optional
+	for _, c := range *ec {
+		if c.Path == "" {
+			return errors.New("no path specified for engine in config file")
+		}
+
+		for _, o := range c.UCIOptions {
+			if o.Name == "" && o.Value != "" {
+				return errors.New("engine option value specified without name")
+			}
+		}
+	}
+
+	return nil
+}
+
+// NewEnginesFromConfig sets up all engines described in a JSON config file
+func NewEnginesFromConfig(path string) ([]*Engine, error) {
+	config := EngConfig{}
+	engs := []*Engine{}
+
+	if err := config.parseConfig(path); err != nil {
+		return nil, err
+	}
+
+	for _, c := range config {
+		eng, err := NewEngineFromPath(c.Path, c.DisplayName)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = eng.UCI(); err != nil {
+			return nil, err
+		}
+
+		for _, o := range c.UCIOptions {
+			if err = eng.SendOption(o.Name, o.Value); err != nil {
+				return nil, err
+			}
+		}
+
+		engs = append(engs, eng)
+	}
+
+	return engs, nil
 }
