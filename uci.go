@@ -24,10 +24,11 @@ import (
 	"strings"
 )
 
-// EngOptions is a slice of option names and values
-type EngOptions struct {
-	Name    string
-	Value   string
+// EngOption is a slice of option names and values
+type EngOption struct {
+	Name  string
+	Value string
+
 	Type    string
 	Default string
 	Min     string
@@ -45,8 +46,8 @@ type Engine struct {
 	name   string
 	author string
 
-	defaultOptions []EngOptions
-	setOptions     []EngOptions
+	defaultOptions []EngOption
+	setOptions     []EngOption
 }
 
 // PrintInfo prints the name, authror, defaultOptions, and SetOptions
@@ -91,7 +92,7 @@ func (e *Engine) parseUCILine(s []string) {
 		return ret, i
 	}
 
-	lineOptions := EngOptions{}
+	lineOptions := EngOption{}
 
 	for i := 0; i < len(s); i++ {
 		var skip int
@@ -125,8 +126,6 @@ func (e *Engine) parseUCILine(s []string) {
 // UCI sends the uci command to the engine and sets up values in the Engine
 // struct
 func (e *Engine) UCI() error {
-	// defaults := EngOptions{}
-
 	_, err := e.stdin.WriteString(fmt.Sprintf("uci\n"))
 	if err != nil {
 		return err
@@ -158,11 +157,64 @@ Loop:
 				e.author = strings.Join(lineSlice[2:], " ")
 			}
 		case "option":
-			e.parseUCILine(lineSlice)
+			e.parseUCILine(lineSlice[1:])
 		case "uciok":
 			break Loop
 		}
 	}
+
+	return nil
+}
+
+// SendCommand sends a generic string to the engine without guarantee that
+// the command was accepted. The input command should not include a newline.
+func (e *Engine) SendCommand(command string) error {
+	_, err := e.stdin.WriteString(command + "\n")
+	if err != nil {
+		return err
+	}
+
+	err = e.stdin.Flush()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SendOption sends an option to the engine
+func (e *Engine) SendOption(name, value string) error {
+	var sendString string
+
+	if value == "" {
+		sendString = fmt.Sprintf("setoption name %s", name)
+	} else {
+		sendString = fmt.Sprintf("setoption name %s value %s", name, value)
+	}
+
+	if err := e.SendCommand(sendString); err != nil {
+		return err
+	}
+
+	setOption := EngOption{}
+	setOption.Name = name
+	setOption.Value = value
+
+	// Updates the options sent to the engine, and overwrites previously
+	// set option with the same name
+	mergeSetOptions := func(prev []EngOption, new EngOption) []EngOption {
+		for i, v := range prev {
+			if v.Name == setOption.Name {
+				prev = append(prev[:i], prev[i+1:]...)
+				break
+			}
+		}
+
+		prev = append(prev, new)
+		return prev
+	}
+
+	e.setOptions = mergeSetOptions(e.setOptions, setOption)
 
 	return nil
 }
