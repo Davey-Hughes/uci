@@ -23,8 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
+	"text/scanner"
 	"time"
 )
 
@@ -74,22 +78,34 @@ type Info struct {
 	CurrLine       []string // current line the engine is calculating
 }
 
+// EngChans are the channels used by the engine
+type EngChans struct {
+	infoDone chan bool
+	readyOK  chan bool
+}
+
 // Engine holds information about the engine executable, the communication to
 // the engine, and information returned from the engine
 type Engine struct {
-	cmd    *exec.Cmd
-	stdout *bufio.Reader
-	stdin  *bufio.Writer
+	cmd    *exec.Cmd     // interface for the external engine program
+	stdout *bufio.Reader // engine stdout buffer
+	stdin  *bufio.Writer // engine stdin buffer
 
-	name   string
-	author string
-	dName  string
+	name   string // name specified by the engine
+	author string // author specified by the engine
+	dName  string // displayName specified by the GUI
 
-	defaultOptions []EngOption
-	setOptions     []EngOption
+	defaultOptions []EngOption // options returned when sending uci to engine
+	setOptions     []EngOption // options set by GUI
+
+	infoBuf      []Info // information returned by the engine
+	infoBufCap   int    // max capacity of the slice, or 0 if none specified
+	sync.RWMutex        // embedded mutex for editing the info buf
+
+	chans EngChans // channels used by the engine
 }
 
-// PrintInfo prints the name, authror, defaultOptions, and SetOptions
+// PrintInfo prints the name, author defaultOptions, and SetOptions
 func (e *Engine) PrintInfo() {
 	fmt.Printf("Name: %s\n", e.name)
 	fmt.Printf("Author: %s\n", e.author)
@@ -109,7 +125,6 @@ func (e *Engine) PrintInfo() {
 
 // parses the output of the uci command
 func (e *Engine) parseUCILine(s []string) {
-
 	f := func(s []string) (string, int) {
 		keywords := []string{"name", "type", "default", "min", "max", "var"}
 		ret := ""
@@ -309,7 +324,7 @@ func (e *Engine) SendOption(name, value string) error {
 // engine is calculating, this function throws away any other output from the
 // engine while waiting for isready, so this should be used with care
 func (e *Engine) WaitReadyOK() error {
-	if err := e.SendCommand("isready\n"); err != nil {
+	if err := e.SendCommand("isready"); err != nil {
 		return err
 	}
 
@@ -321,6 +336,10 @@ func (e *Engine) WaitReadyOK() error {
 		case <-timeout:
 			return errors.New("timed out")
 		case <-tick:
+			if e.chans.readyOK != nil {
+				continue
+			}
+
 			line, err := e.stdout.ReadString('\n')
 			if err != nil {
 				return err
@@ -329,15 +348,202 @@ func (e *Engine) WaitReadyOK() error {
 			if line == "readyok\n" {
 				return nil
 			}
+		case <-e.chans.readyOK:
+			return nil
 		}
 	}
+}
+
+// WaitCollection waits for the info collection goroutine to finish
+func (e *Engine) WaitCollection(timeout time.Duration) error {
+	if e.chans.infoDone == nil {
+		return errors.New("infoDone channel not made")
+	}
+
+	timer := time.After(timeout)
+
+	select {
+	case <-e.chans.infoDone:
+		return nil
+	case <-timer:
+		return errors.New("timed out")
+	}
+}
+
+// GetInfo returns the last info lines returned by the engine, or all lines if
+// last is negative
+func (e *Engine) GetInfo(last int) []Info {
+	var ret []Info
+
+	e.RLock()
+	defer e.RUnlock()
+
+	if last < 0 || last > e.infoBufCap {
+		ret = make([]Info, len(e.infoBuf))
+		copy(ret, e.infoBuf)
+	} else {
+		ret = make([]Info, last)
+		copy(ret, e.infoBuf[len(e.infoBuf)-last:])
+	}
+
+	return ret
+
+}
+
+// parses the stdout of the engine
+func (e *Engine) parseStdout(line string) error {
+	if strings.HasPrefix(line, "readyok") {
+		e.chans.readyOK <- true
+		return nil
+	}
+
+	var err error
+	rd := strings.NewReader(line)
+	s := scanner.Scanner{}
+	s.Init(rd)
+	s.Mode = scanner.ScanIdents | scanner.ScanChars | scanner.ScanInts
+
+	atoi := func(dest int, s scanner.Scanner) error {
+		s.Scan()
+		dest, err = strconv.Atoi(s.TokenText())
+		return err
+	}
+
+	info := Info{}
+	var StringSlice []string
+	for s.Scan() != scanner.EOF {
+		switch s.TokenText() {
+		case "info":
+		case "depth":
+			if err = atoi(info.Depth, s); err != nil {
+				return err
+			}
+		case "seldepth":
+			if err = atoi(info.SelDepth, s); err != nil {
+				return err
+			}
+		case "time":
+			if err = atoi(info.Time, s); err != nil {
+				return err
+			}
+		case "nodes":
+			if err = atoi(info.Nodes, s); err != nil {
+				return err
+			}
+		case "nps":
+			if err = atoi(info.NodesPerSecond, s); err != nil {
+				return err
+			}
+		case "pv": // assumes pv is at the end of the line
+			for s.Scan() != scanner.EOF {
+				info.PV = append(info.PV, s.TokenText())
+			}
+		case "multipv":
+			if err = atoi(info.MultiPV, s); err != nil {
+				return err
+			}
+		case "score":
+			s.Scan()
+			switch s.TokenText() {
+			case "cp":
+				s.Scan()
+			case "mate":
+				info.Score.Mate = true
+				s.Scan()
+			}
+			neg := 1
+			if s.TokenText() == "-" {
+				neg = -1
+				s.Scan()
+			}
+			info.Score.Val, err = strconv.Atoi(s.TokenText())
+			if err != nil {
+				return err
+			}
+			info.Score.Val *= neg
+		case "currmove":
+			s.Scan()
+			info.CurrMove = s.TokenText()
+		case "currmovenumber":
+			if err = atoi(info.CurrMoveNumber, s); err != nil {
+				return err
+			}
+		case "hashfull":
+			if err = atoi(info.HashFull, s); err != nil {
+				return err
+			}
+		case "tbhits":
+			if err = atoi(info.TBHits, s); err != nil {
+				return err
+			}
+		case "sbhits":
+			if err = atoi(info.SBHits, s); err != nil {
+				return err
+			}
+		case "cpuload":
+			if err = atoi(info.CPULoad, s); err != nil {
+				return err
+			}
+		case "string":
+			for s.Scan() != scanner.EOF {
+				StringSlice = append(StringSlice, s.TokenText())
+			}
+		case "refutation": // assumes refutation at end of line
+			for s.Scan() != scanner.EOF {
+				info.Refutation = append(info.Refutation, s.TokenText())
+			}
+		case "currline":
+			for s.Scan() != scanner.EOF {
+				info.CurrLine = append(info.CurrLine, s.TokenText())
+			}
+		}
+	}
+
+	// put string slice into a single string separated by spaces
+	info.String = strings.Join(StringSlice, " ")
+
+	e.Lock()
+	defer e.Unlock()
+
+	// TODO check performance of this
+	if len(e.infoBuf) > e.infoBufCap && e.infoBufCap != 0 {
+		e.infoBuf = append(e.infoBuf[len(e.infoBuf)-e.infoBufCap:], info)
+	} else {
+		e.infoBuf = append(e.infoBuf, info)
+	}
+
+	return nil
+}
+
+// StartInfoCollection starts a goroutine that continually parses information
+// sent by the engine
+//
+// Once info collection has started it cannot be stopped
+//
+// TODO: handle error better
+func (e *Engine) StartInfoCollection() error {
+	e.chans.infoDone = make(chan bool)
+	e.chans.readyOK = make(chan bool)
+
+	go func() error {
+		for {
+			line, err := e.stdout.ReadString('\n')
+			if err != nil {
+				log.Fatalf("%v\n", err)
+			}
+
+			e.parseStdout(strings.Trim(line, "\n"))
+		}
+	}()
+
+	return nil
 }
 
 // NewEngineFromPath returns an Engine it has spun up given a path and
 // connected communication to. If the displayName is not specified (empty
 // string), the displayName will be set to the name given by the engine when
 // UCI() is called.
-func NewEngineFromPath(path, displayName string) (*Engine, error) {
+func NewEngineFromPath(path, displayName string, infoBufCap int) (*Engine, error) {
 	eng := Engine{}
 	eng.cmd = exec.Command(path)
 
@@ -359,6 +565,12 @@ func NewEngineFromPath(path, displayName string) (*Engine, error) {
 	eng.stdout = bufio.NewReader(stdout)
 	eng.dName = displayName
 
+	if infoBufCap < 0 {
+		return nil, errors.New("infoBufCap can't be negative")
+	}
+
+	eng.infoBufCap = infoBufCap
+
 	return &eng, nil
 }
 
@@ -366,6 +578,7 @@ func NewEngineFromPath(path, displayName string) (*Engine, error) {
 type EngConfig []struct {
 	DisplayName string `json:"displayName"` // name to display for the engine
 	Path        string `json:"path"`        // path to engine executable
+	InfoBufCap  int    `json:"infoBufCap"`  // max capacity for the info buffer
 	UCIOptions  []struct {
 		Name  string `json:"name"`  // name of engine option
 		Value string `json:"value"` // value of engine option
@@ -411,7 +624,7 @@ func NewEnginesFromConfig(path string) ([]*Engine, error) {
 	}
 
 	for _, c := range config {
-		eng, err := NewEngineFromPath(c.Path, c.DisplayName)
+		eng, err := NewEngineFromPath(c.Path, c.DisplayName, c.InfoBufCap)
 		if err != nil {
 			return nil, err
 		}
