@@ -25,6 +25,7 @@ import (
 	"io/ioutil"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // EngOption is a slice of option names and values
@@ -239,6 +240,33 @@ func (e *Engine) SendOption(name, value string) error {
 	return nil
 }
 
+// WaitReadyOK sends isready to engine and waits for readyok
+// sets a 5s timeout and checks every 10ms for the readyok response
+func (e *Engine) WaitReadyOK() error {
+	if err := e.SendCommand("isready\n"); err != nil {
+		return err
+	}
+
+	timeout := time.After(5 * time.Second)
+	tick := time.Tick(10 * time.Millisecond)
+
+	for {
+		select {
+		case <-timeout:
+			return errors.New("timed out")
+		case <-tick:
+			line, err := e.stdout.ReadString('\n')
+			if err != nil {
+				return err
+			}
+
+			if line == "readyok\n" {
+				return nil
+			}
+		}
+	}
+}
+
 // NewEngineFromPath returns an Engine it has spun up given a path and
 // connected communication to. If the displayName is not specified (empty
 // string), the displayName will be set to the name given by the engine when
@@ -246,17 +274,21 @@ func (e *Engine) SendOption(name, value string) error {
 func NewEngineFromPath(path, displayName string) (*Engine, error) {
 	eng := Engine{}
 	eng.cmd = exec.Command(path)
+
 	stdin, err := eng.cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
+
 	stdout, err := eng.cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
 	}
+
 	if err := eng.cmd.Start(); err != nil {
 		return nil, err
 	}
+
 	eng.stdin = bufio.NewWriter(stdin)
 	eng.stdout = bufio.NewReader(stdout)
 	eng.dName = displayName
@@ -274,6 +306,7 @@ type EngConfig []struct {
 	}
 }
 
+// parses the specified config file
 func (ec *EngConfig) parseConfig(filename string) error {
 	raw, err := ioutil.ReadFile(filename)
 	if err != nil {
@@ -325,6 +358,10 @@ func NewEnginesFromConfig(path string) ([]*Engine, error) {
 			if err = eng.SendOption(o.Name, o.Value); err != nil {
 				return nil, err
 			}
+		}
+
+		if err = eng.WaitReadyOK(); err != nil {
+			return nil, err
 		}
 
 		engs = append(engs, eng)
