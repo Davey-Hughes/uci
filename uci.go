@@ -29,15 +29,49 @@ import (
 )
 
 // EngOption is a slice of option names and values
+// Only the first two options are set with options specified by the GUI
+//
+// Because any variety of options can be specified by the engine, all fields
+// are recorded as strings. If more information about a specific engine is
+// known, these values can be parsed into native types at discretion
 type EngOption struct {
-	Name  string
-	Value string
+	Name  string // name of the option
+	Value string // value of the option
 
-	Type    string
-	Default string
-	Min     string
-	Max     string
-	Var     []string
+	Type    string   // type of the option
+	Default string   // default value of option
+	Min     string   // min possible value of option
+	Max     string   // max possible value of option
+	Var     []string // predefined values of this parameter
+}
+
+// Score is the score returned by the engine
+type Score struct {
+	Val        int  // score in centipawns or mate in moves
+	Lowerbound bool // true if the score is a lowerbound
+	Upperbound bool // true if the score is an upperbound
+	Mate       bool // false if val in centipawns, true if val is mate in moves
+}
+
+// Info returned from the engine
+type Info struct {
+	Depth          int      // search depth in plies
+	SelDepth       int      // selective search depth in plies
+	Time           int      // the time searched in ms
+	Nodes          int      // nodes searched
+	NodesPerSecond int      // nodes per second searched
+	PV             []string // the best line found
+	MultiPV        int      // multipv ranking, 0 if multipv not set
+	Score          Score    // score
+	CurrMove       string   // currently searching this move
+	CurrMoveNumber int      // currently searching this move number
+	HashFull       int      // the hash is x permill full
+	TBHits         int      // number of positions found in the endgame table bases
+	SBHits         int      // number of positions found in the shredder endgame databases
+	CPULoad        int      // CPU usage of the engine in permill
+	String         string   // any string str which will be displayed be the engine
+	Refutation     []string // first move refuted by the line of remaining moves
+	CurrLine       []string // current line the engine is calculating
 }
 
 // Engine holds information about the engine executable, the communication to
@@ -330,11 +364,11 @@ func NewEngineFromPath(path, displayName string) (*Engine, error) {
 
 // EngConfig holds the information specified in the config file
 type EngConfig []struct {
-	DisplayName string `json:"displayName"`
-	Path        string `json:"path"`
+	DisplayName string `json:"displayName"` // name to display for the engine
+	Path        string `json:"path"`        // path to engine executable
 	UCIOptions  []struct {
-		Name  string `json:"name"`
-		Value string `json:"value"`
+		Name  string `json:"name"`  // name of engine option
+		Value string `json:"value"` // value of engine option
 	}
 }
 
