@@ -370,6 +370,13 @@ func (e *Engine) UCI() error {
 
 	<-e.chans.uciOK
 
+	e.Lock()
+	defer e.Unlock()
+
+	if e.dName == "" {
+		e.dName = e.name
+	}
+
 	return nil
 }
 
@@ -555,7 +562,7 @@ func (e *Engine) parseStdout(line string) error {
 // startStdoutParsing starts a goroutine that continually parses information
 // sent by the engine
 //
-// Once info collection has started it cannot be stopped
+// Once parsing has started it cannot be stopped until the engine is stopped
 //
 // TODO: handle error better
 func (e *Engine) startStdoutParsing() error {
@@ -589,7 +596,9 @@ func (e *Engine) startStdoutParsing() error {
 // if lineBufSize is zero or negative the default size will be used
 //
 // args are optional
-func NewEngineFromPath(path, displayName string, infoBufCap, lineBufSize int, args ...string) (*Engine, error) {
+func NewEngineFromPath(path, displayName string, infoBufCap,
+	lineBufSize int, args ...string) (*Engine, error) {
+
 	eng := Engine{}
 	eng.cmd = exec.Command(path, args...)
 
@@ -609,10 +618,6 @@ func NewEngineFromPath(path, displayName string, infoBufCap, lineBufSize int, ar
 	eng.stdout = stdout
 
 	eng.dName = displayName
-
-	if eng.dName == "" {
-		eng.dName = eng.name
-	}
 
 	if infoBufCap < 0 {
 		eng.infoBufCap = 0
@@ -683,7 +688,8 @@ func NewEnginesFromConfig(path string) ([]*Engine, error) {
 	}
 
 	for _, c := range config {
-		eng, err := NewEngineFromPath(c.Path, c.DisplayName, c.InfoBufCap, c.LineBufSize, c.Args...)
+		eng, err := NewEngineFromPath(c.Path, c.DisplayName,
+			c.InfoBufCap, c.LineBufSize, c.Args...)
 		if err != nil {
 			return nil, err
 		}
