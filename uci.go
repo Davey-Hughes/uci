@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os/exec"
@@ -579,16 +580,18 @@ func (e *Engine) parseStdout(line string) error {
 func (e *Engine) StartInfoCollection() error {
 	e.chans.infoDone = make(chan bool)
 	e.chans.readyOK = make(chan bool)
-	e.chans.bestMove = make(chan BestMove, 10)
+	e.chans.bestMove = make(chan BestMove, 16)
 
 	go func() error {
 		for {
 			line, err := e.stdout.ReadString('\n')
-			if err != nil {
+			if err == io.EOF {
+				fmt.Println("closed")
+				return nil
+			} else if err != nil {
 				log.Fatalf("%v\n", err)
 			}
 
-			fmt.Println(line + "\n")
 			e.parseStdout(strings.Trim(line, "\n"))
 		}
 	}()
