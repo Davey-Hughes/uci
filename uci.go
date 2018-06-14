@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os/exec"
@@ -31,6 +30,12 @@ import (
 	"sync"
 	"text/scanner"
 	"time"
+)
+
+const (
+	// the default size of the channel (in number of strings) for the
+	// stdout of the engine
+	defaultStdoutChanSize = 4096
 )
 
 // EngOption is a slice of option names and values
@@ -87,17 +92,18 @@ type Info struct {
 
 // EngChans are the channels used by the engine
 type EngChans struct {
-	infoDone chan bool
-	readyOK  chan bool
-	bestMove chan BestMove
+	readyOK    chan bool
+	bestMove   chan BestMove
+	doneStdout chan bool // stop stdout goroutines
+	uciOK      chan bool // wait for uciok line
 }
 
 // Engine holds information about the engine executable, the communication to
 // the engine, and information returned from the engine
 type Engine struct {
 	cmd    *exec.Cmd     // interface for the external engine program
-	stdout *bufio.Reader // engine stdout buffer
 	stdin  *bufio.Writer // engine stdin buffer
+	stdout chan string   // stdout buffered channel
 
 	name   string // name specified by the engine
 	author string // author specified by the engine
@@ -109,13 +115,16 @@ type Engine struct {
 	infoBuf      []Info   // information returned by the engine
 	infoBufCap   int      // max capacity of the slice, or 0 if none specified
 	lastBestMove BestMove // most recent bestmove
-	sync.RWMutex          // embedded mutex for editing the info buf and bestmove
+	sync.RWMutex          // embedded mutex for editing the info buf, bestmove, and options
 
-	chans EngChans // channels used by the engine
+	chans EngChans // internal channels used by the engine
 }
 
 // PrintInfo prints the name, author defaultOptions, and SetOptions
 func (e *Engine) PrintInfo() {
+	e.RLock()
+	defer e.RUnlock()
+
 	fmt.Printf("Name: %s\n", e.name)
 	fmt.Printf("Author: %s\n", e.author)
 	fmt.Printf("Display Name: %s\n\n", e.dName)
@@ -130,6 +139,168 @@ func (e *Engine) PrintInfo() {
 	for _, v := range e.setOptions {
 		fmt.Printf("%+v\n", v)
 	}
+}
+
+// SetDisplayName sets the display name of the engine
+func (e *Engine) SetDisplayName(displayName string) {
+	e.Lock()
+	defer e.Unlock()
+
+	e.dName = displayName
+}
+
+// SendCommand sends a generic string to the engine without guarantee that
+// the command was accepted. The input command should not include a newline.
+func (e *Engine) SendCommand(command string) error {
+	_, err := e.stdin.WriteString(command + "\n")
+	if err != nil {
+		return err
+	}
+
+	err = e.stdin.Flush()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SendFEN updates the engine position with a FEN string
+func (e *Engine) SendFEN(fen string) error {
+	return e.SendCommand(fmt.Sprintf("position fen %s", fen))
+}
+
+// SendUCINewGame sends a ucinewgame command to the engine
+func (e *Engine) SendUCINewGame() error {
+	return e.SendCommand("ucinewgame")
+}
+
+// SendStop sends a stop command to the engine
+func (e *Engine) SendStop() error {
+	return e.SendCommand("stop")
+}
+
+// SendQuit sends a quit command to the engine and waits for the program to
+// exit
+func (e *Engine) SendQuit() error {
+	if err := e.SendCommand("quit"); err != nil {
+		return err
+	}
+
+	// wait for stdout channel to finish
+	for len(e.stdout) > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := e.cmd.Wait(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SendPonderHit sends a ponderhit command to the engine
+// func (e *Engine) SendPonderHit() error {
+// return e.SendCommand("ponderhit")
+// }
+
+// SendOption sends an option to the engine
+func (e *Engine) SendOption(name, value string) error {
+	var sendString string
+
+	if value == "" {
+		sendString = fmt.Sprintf("setoption name %s", name)
+	} else {
+		sendString = fmt.Sprintf("setoption name %s value %s", name, value)
+	}
+
+	if err := e.SendCommand(sendString); err != nil {
+		return err
+	}
+
+	setOption := EngOption{}
+	setOption.Name = name
+	setOption.Value = value
+
+	// Updates the options sent to the engine, and overwrites previously
+	// set option with the same name
+	mergeSetOptions := func(prev []EngOption, new EngOption) []EngOption {
+		for i, v := range prev {
+			if v.Name == setOption.Name {
+				prev = append(prev[:i], prev[i+1:]...)
+				break
+			}
+		}
+
+		prev = append(prev, new)
+		return prev
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	e.setOptions = mergeSetOptions(e.setOptions, setOption)
+
+	return nil
+}
+
+// WaitReadyOK sends isready to engine and waits for readyok
+// sets a 5s timeout and checks every 10ms for the readyok response
+//
+// Note: while isready can be sent to the engine at any time, even while the
+// engine is calculating, this function throws away any other output from the
+// engine while waiting for isready, so this should be used with care
+func (e *Engine) WaitReadyOK(timeout time.Duration) error {
+	if err := e.SendCommand("isready"); err != nil {
+		return err
+	}
+
+	timer := time.After(timeout)
+
+	for {
+		select {
+		case <-timer:
+			return errors.New("timed out")
+		case <-e.chans.readyOK:
+			return nil
+		}
+	}
+}
+
+// WaitBestMove waits for the bestmove to be sent
+func (e *Engine) WaitBestMove(timeout time.Duration) (BestMove, error) {
+	if e.chans.bestMove == nil {
+		return BestMove{}, errors.New("bestMove channel not made")
+	}
+
+	timer := time.After(timeout)
+
+	select {
+	case b := <-e.chans.bestMove:
+		return b, nil
+	case <-timer:
+		return BestMove{}, errors.New("timed out")
+	}
+}
+
+// GetInfo returns the last info lines returned by the engine, or all lines if
+// last is negative
+func (e *Engine) GetInfo(last int) []Info {
+	var ret []Info
+
+	e.RLock()
+	defer e.RUnlock()
+
+	if last < 0 || last > e.infoBufCap {
+		ret = make([]Info, len(e.infoBuf))
+		copy(ret, e.infoBuf)
+	} else {
+		ret = make([]Info, last)
+		copy(ret, e.infoBuf[len(e.infoBuf)-last:])
+	}
+
+	return ret
+
 }
 
 // parses the output of the uci command
@@ -184,272 +355,82 @@ func (e *Engine) parseUCILine(s []string) {
 		}
 	}
 
+	e.Lock()
+	defer e.Unlock()
+
 	e.defaultOptions = append(e.defaultOptions, lineOptions)
 }
 
 // UCI sends the uci command to the engine and sets up values in the Engine
 // struct
 func (e *Engine) UCI() error {
-	_, err := e.stdin.WriteString(fmt.Sprintf("uci\n"))
-	if err != nil {
+	if err := e.SendCommand("uci"); err != nil {
 		return err
 	}
 
-	err = e.stdin.Flush()
-	if err != nil {
-		return err
-	}
+	<-e.chans.uciOK
 
-Loop:
-	for {
-		line, err := e.stdout.ReadString('\n')
-		if err != nil {
-			return err
-		}
+	return nil
+}
 
-		lineSlice := strings.Fields(line)
+// parses the stdout of the engine
+func (e *Engine) parseStdout(line string) error {
+	// check the prefix
+	index := strings.IndexByte(line, ' ')
+	if index != -1 {
+		switch line[:index] {
+		case "bestmove":
+			e.Lock()
 
-		if len(lineSlice) == 0 {
-			continue
-		}
+			lineSlice := strings.Split(line, " ")
 
-		switch lineSlice[0] {
+			e.lastBestMove.BestMove = lineSlice[1]
+
+			if len(lineSlice) > 2 {
+				e.lastBestMove.Ponder = lineSlice[3]
+			} else {
+				e.lastBestMove.Ponder = ""
+			}
+
+			b := BestMove{e.lastBestMove.BestMove, e.lastBestMove.Ponder}
+
+			e.Unlock()
+
+		Loop:
+			// explicitly empty the channel
+			for {
+				select {
+				case <-e.chans.bestMove:
+				default:
+					break Loop
+				}
+			}
+
+			e.chans.bestMove <- b
+			return nil
 		case "id":
+			e.Lock()
+			defer e.Unlock()
+
+			lineSlice := strings.Fields(line)
 			if lineSlice[1] == "name" {
 				e.name = strings.Join(lineSlice[2:], " ")
 			} else if lineSlice[1] == "author" {
 				e.author = strings.Join(lineSlice[2:], " ")
 			}
+			return nil
 		case "option":
+			lineSlice := strings.Fields(line)
 			e.parseUCILine(lineSlice[1:])
-		case "uciok":
-			break Loop
-		}
-	}
-
-	if e.dName == "" {
-		e.dName = e.name
-	}
-
-	return nil
-}
-
-// SetDisplayName sets the display name of the engine
-func (e *Engine) SetDisplayName(displayName string) {
-	e.dName = displayName
-}
-
-// SendCommand sends a generic string to the engine without guarantee that
-// the command was accepted. The input command should not include a newline.
-func (e *Engine) SendCommand(command string) error {
-	_, err := e.stdin.WriteString(command + "\n")
-	if err != nil {
-		return err
-	}
-
-	err = e.stdin.Flush()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// SendFEN updates the engine position with a FEN string
-func (e *Engine) SendFEN(fen string) error {
-	return e.SendCommand(fmt.Sprintf("position fen %s", fen))
-}
-
-// SendUCINewGame sends a ucinewgame command to the engine
-func (e *Engine) SendUCINewGame() error {
-	return e.SendCommand("ucinewgame")
-}
-
-// SendStop sends a stop command to the engine
-func (e *Engine) SendStop() error {
-	return e.SendCommand("stop")
-}
-
-// SendQuit sends a quit command to the engine and waits for the program to
-// exit
-func (e *Engine) SendQuit() error {
-	if err := e.SendCommand("quit"); err != nil {
-		return err
-	}
-
-	if err := e.cmd.Wait(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// SendPonderHit sends a ponderhit command to the engine
-// func (e *Engine) SendPonderHit() error {
-// return e.SendCommand("ponderhit")
-// }
-
-// SendOption sends an option to the engine
-func (e *Engine) SendOption(name, value string) error {
-	var sendString string
-
-	if value == "" {
-		sendString = fmt.Sprintf("setoption name %s", name)
-	} else {
-		sendString = fmt.Sprintf("setoption name %s value %s", name, value)
-	}
-
-	if err := e.SendCommand(sendString); err != nil {
-		return err
-	}
-
-	setOption := EngOption{}
-	setOption.Name = name
-	setOption.Value = value
-
-	// Updates the options sent to the engine, and overwrites previously
-	// set option with the same name
-	mergeSetOptions := func(prev []EngOption, new EngOption) []EngOption {
-		for i, v := range prev {
-			if v.Name == setOption.Name {
-				prev = append(prev[:i], prev[i+1:]...)
-				break
-			}
-		}
-
-		prev = append(prev, new)
-		return prev
-	}
-
-	e.setOptions = mergeSetOptions(e.setOptions, setOption)
-
-	return nil
-}
-
-// WaitReadyOK sends isready to engine and waits for readyok
-// sets a 5s timeout and checks every 10ms for the readyok response
-//
-// Note: while isready can be sent to the engine at any time, even while the
-// engine is calculating, this function throws away any other output from the
-// engine while waiting for isready, so this should be used with care
-func (e *Engine) WaitReadyOK() error {
-	if err := e.SendCommand("isready"); err != nil {
-		return err
-	}
-
-	timeout := time.After(5 * time.Second)
-	tick := time.Tick(10 * time.Millisecond)
-
-	for {
-		select {
-		case <-timeout:
-			return errors.New("timed out")
-		case <-tick:
-			if e.chans.readyOK != nil {
-				continue
-			}
-
-			line, err := e.stdout.ReadString('\n')
-			if err != nil {
-				return err
-			}
-
-			if line == "readyok\n" {
-				return nil
-			}
-		case <-e.chans.readyOK:
 			return nil
 		}
 	}
-}
 
-// WaitCollection waits for the info collection goroutine to finish
-func (e *Engine) WaitCollection(timeout time.Duration) error {
-	if e.chans.infoDone == nil {
-		return errors.New("infoDone channel not made")
-	}
-
-	timer := time.After(timeout)
-
-	select {
-	case <-e.chans.infoDone:
+	if strings.HasPrefix(line, "uciok") {
+		e.chans.uciOK <- true
 		return nil
-	case <-timer:
-		return errors.New("timed out")
-	}
-}
-
-// WaitBestMove waits for the bestmove to be sent
-func (e *Engine) WaitBestMove(timeout time.Duration) (BestMove, error) {
-	if e.chans.bestMove == nil {
-		return BestMove{}, errors.New("bestMove channel not made")
-	}
-
-	timer := time.After(timeout)
-
-	select {
-	case b := <-e.chans.bestMove:
-		return b, nil
-	case <-timer:
-		return BestMove{}, errors.New("timed out")
-	}
-}
-
-// GetInfo returns the last info lines returned by the engine, or all lines if
-// last is negative
-func (e *Engine) GetInfo(last int) []Info {
-	var ret []Info
-
-	e.RLock()
-	defer e.RUnlock()
-
-	if last < 0 || last > e.infoBufCap {
-		ret = make([]Info, len(e.infoBuf))
-		copy(ret, e.infoBuf)
-	} else {
-		ret = make([]Info, last)
-		copy(ret, e.infoBuf[len(e.infoBuf)-last:])
-	}
-
-	return ret
-
-}
-
-// parses the stdout of the engine
-func (e *Engine) parseStdout(line string) error {
-	if strings.HasPrefix(line, "readyok") {
+	} else if strings.HasPrefix(line, "readyok") {
 		e.chans.readyOK <- true
-		return nil
-	}
-
-	if strings.HasPrefix(line, "bestmove") {
-		e.Lock()
-
-		lineSlice := strings.Split(line, " ")
-
-		e.lastBestMove.BestMove = lineSlice[1]
-
-		if len(lineSlice) > 2 {
-			e.lastBestMove.Ponder = lineSlice[3]
-		} else {
-			e.lastBestMove.Ponder = ""
-		}
-
-		b := BestMove{e.lastBestMove.BestMove, e.lastBestMove.Ponder}
-
-		e.Unlock()
-
-		// explicitly empty the channel
-	Loop:
-		for {
-			select {
-			case <-e.chans.bestMove:
-			default:
-				break Loop
-			}
-		}
-
-		e.chans.bestMove <- b
 		return nil
 	}
 
@@ -571,28 +552,29 @@ func (e *Engine) parseStdout(line string) error {
 	return nil
 }
 
-// StartInfoCollection starts a goroutine that continually parses information
+// startStdoutParsing starts a goroutine that continually parses information
 // sent by the engine
 //
 // Once info collection has started it cannot be stopped
 //
 // TODO: handle error better
-func (e *Engine) StartInfoCollection() error {
-	e.chans.infoDone = make(chan bool)
+func (e *Engine) startStdoutParsing() error {
 	e.chans.readyOK = make(chan bool)
+	e.chans.doneStdout = make(chan bool)
 	e.chans.bestMove = make(chan BestMove, 16)
+	e.chans.uciOK = make(chan bool)
 
 	go func() error {
 		for {
-			line, err := e.stdout.ReadString('\n')
-			if err == io.EOF {
-				fmt.Println("closed")
+			select {
+			case line := <-e.stdout:
+				err := e.parseStdout(strings.Trim(line, "\n"))
+				if err != nil {
+					log.Fatalf("%v\n", err)
+				}
+			case <-e.chans.doneStdout:
 				return nil
-			} else if err != nil {
-				log.Fatalf("%v\n", err)
 			}
-
-			e.parseStdout(strings.Trim(line, "\n"))
 		}
 	}()
 
@@ -603,17 +585,42 @@ func (e *Engine) StartInfoCollection() error {
 // connected communication to. If the displayName is not specified (empty
 // string), the displayName will be set to the name given by the engine when
 // UCI() is called.
-func NewEngineFromPath(path, displayName string, infoBufCap int) (*Engine, error) {
+//
+// if lineBufSize is zero or negative the default size will be used
+//
+// args are optional
+func NewEngineFromPath(path, displayName string, infoBufCap, lineBufSize int, args ...string) (*Engine, error) {
 	eng := Engine{}
-	eng.cmd = exec.Command(path)
+	eng.cmd = exec.Command(path, args...)
 
 	stdin, err := eng.cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
 
-	stdout, err := eng.cmd.StdoutPipe()
-	if err != nil {
+	stdout := make(chan string, defaultStdoutChanSize)
+	if lineBufSize == 0 {
+		eng.cmd.Stdout = NewOutputStream(stdout, defaultLineBufferSize)
+	} else {
+		eng.cmd.Stdout = NewOutputStream(stdout, lineBufSize)
+	}
+
+	eng.stdin = bufio.NewWriter(stdin)
+	eng.stdout = stdout
+
+	eng.dName = displayName
+
+	if eng.dName == "" {
+		eng.dName = eng.name
+	}
+
+	if infoBufCap < 0 {
+		eng.infoBufCap = 0
+	} else {
+		eng.infoBufCap = infoBufCap
+	}
+
+	if err = eng.startStdoutParsing(); err != nil {
 		return nil, err
 	}
 
@@ -621,24 +628,16 @@ func NewEngineFromPath(path, displayName string, infoBufCap int) (*Engine, error
 		return nil, err
 	}
 
-	eng.stdin = bufio.NewWriter(stdin)
-	eng.stdout = bufio.NewReader(stdout)
-	eng.dName = displayName
-
-	if infoBufCap < 0 {
-		return nil, errors.New("infoBufCap can't be negative")
-	}
-
-	eng.infoBufCap = infoBufCap
-
 	return &eng, nil
 }
 
 // EngConfig holds the information specified in the config file
 type EngConfig []struct {
-	DisplayName string `json:"displayName"` // name to display for the engine
-	Path        string `json:"path"`        // path to engine executable
-	InfoBufCap  int    `json:"infoBufCap"`  // max capacity for the info buffer
+	DisplayName string   `json:"displayName"` // name to display for the engine
+	Path        string   `json:"path"`        // path to engine executable
+	InfoBufCap  int      `json:"infoBufCap"`  // max capacity for the info buffer
+	LineBufSize int      `json:"lineBufSize"` // buffer size for engine stdout
+	Args        []string `json:"args"`        // arguments passed to the engine on startup
 	UCIOptions  []struct {
 		Name  string `json:"name"`  // name of engine option
 		Value string `json:"value"` // value of engine option
@@ -684,7 +683,7 @@ func NewEnginesFromConfig(path string) ([]*Engine, error) {
 	}
 
 	for _, c := range config {
-		eng, err := NewEngineFromPath(c.Path, c.DisplayName, c.InfoBufCap)
+		eng, err := NewEngineFromPath(c.Path, c.DisplayName, c.InfoBufCap, c.LineBufSize, c.Args...)
 		if err != nil {
 			return nil, err
 		}
@@ -699,7 +698,7 @@ func NewEnginesFromConfig(path string) ([]*Engine, error) {
 			}
 		}
 
-		if err = eng.WaitReadyOK(); err != nil {
+		if err = eng.WaitReadyOK(5 * time.Second); err != nil {
 			return nil, err
 		}
 
